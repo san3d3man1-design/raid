@@ -31,6 +31,7 @@ conn.autocommit = True
 # -------------------- CACHES (fast) --------------------
 muted_cache: set[int] = set()
 banned_cache: set[int] = set()
+bot_muted_chats_cache: set[int] = set()  # chats where all bot/via_bot messages get deleted
 
 def db_init():
     with conn.cursor() as cur:
@@ -49,15 +50,23 @@ def db_init():
             chat_id BIGINT PRIMARY KEY
         );
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_muted_chats (
+            chat_id BIGINT PRIMARY KEY
+        );
+        """)
 
 def load_caches():
-    global muted_cache, banned_cache
+    global muted_cache, banned_cache, bot_muted_chats_cache
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT user_id FROM muted_users")
         muted_cache = {int(r["user_id"]) for r in cur.fetchall()}
 
         cur.execute("SELECT user_id FROM banned_users")
         banned_cache = {int(r["user_id"]) for r in cur.fetchall()}
+
+        cur.execute("SELECT chat_id FROM bot_muted_chats")
+        bot_muted_chats_cache = {int(r["chat_id"]) for r in cur.fetchall()}
 
 def add_known_chat(chat_id: int):
     with conn.cursor() as cur:
@@ -96,6 +105,19 @@ def remove_ban(user_id: int):
     banned_cache.discard(user_id)
     with conn.cursor() as cur:
         cur.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
+
+def add_bot_mute_chat(chat_id: int):
+    bot_muted_chats_cache.add(chat_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bot_muted_chats (chat_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (chat_id,),
+        )
+
+def remove_bot_mute_chat(chat_id: int):
+    bot_muted_chats_cache.discard(chat_id)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM bot_muted_chats WHERE chat_id=%s", (chat_id,))
 
 # -------------------- HELPERS --------------------
 def owner_only(update: Update) -> bool:
@@ -228,6 +250,35 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Admin attempted for {user_id} (ok:{ok} fail:{fail})")
 
+async def cmd_mutebot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    chat_id = parse_id_arg(context)
+    if chat_id is None:
+        await update.message.reply_text("Usage: /mutebot <chat_id>")
+        return
+    add_bot_mute_chat(chat_id)
+    await update.message.reply_text(f"✅ Bot-Mute aktiv in Chat: {chat_id}")
+
+async def cmd_unmutebot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    chat_id = parse_id_arg(context)
+    if chat_id is None:
+        await update.message.reply_text("Usage: /unmutebot <chat_id>")
+        return
+    remove_bot_mute_chat(chat_id)
+    await update.message.reply_text(f"✅ Bot-Mute deaktiviert in Chat: {chat_id}")
+
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: shows current chat id (useful for /mutebot)."""
+    if not owner_only(update):
+        return
+    chat = update.effective_chat
+    if not chat:
+        return
+    await update.message.reply_text(f"chat_id: {chat.id} | type: {chat.type}")
+
 # -------------------- MAIN HANDLER --------------------
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -244,13 +295,27 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    # ✅ NEW: delete EVERYTHING sent as sender_chat (anonymous admin + channel-as-sender)
+    # ✅ Delete EVERYTHING sent as sender_chat (anonymous admin + channel-as-sender)
     if msg.sender_chat is not None:
         try:
             await msg.delete()
         except Exception:
             pass
         return
+
+    # ✅ Per-group "mute all bots" (delete all bot/via_bot messages) if enabled for this chat
+    if chat.id in bot_muted_chats_cache:
+        try:
+            # Bots writing directly
+            if msg.from_user and msg.from_user.is_bot:
+                await msg.delete()
+                return
+            # Messages posted via bots (inline/via_bot)
+            if msg.via_bot is not None:
+                await msg.delete()
+                return
+        except Exception:
+            pass
 
     ids = message_ids_to_check(update)
 
@@ -270,7 +335,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
         return
 
-    # Global mute: delete message if sender OR via_bot is muted
+    # Global mute: delete message if sender OR via_bot OR sender_chat (but sender_chat already handled) is muted
     if any(i in muted_cache for i in ids):
         try:
             await msg.delete()
@@ -290,6 +355,10 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("admin", cmd_admin))
+
+    app.add_handler(CommandHandler("mutebot", cmd_mutebot))
+    app.add_handler(CommandHandler("unmutebot", cmd_unmutebot))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
 
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
 
