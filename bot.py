@@ -33,6 +33,10 @@ muted_cache: set[int] = set()
 banned_cache: set[int] = set()
 bot_muted_chats_cache: set[int] = set()  # chats where all bot/via_bot messages get deleted
 
+# Watch/debug (to verify whether we receive updates for certain messages)
+watch_chats: set[int] = set()
+watch_left: dict[int, int] = {}
+
 def db_init():
     with conn.cursor() as cur:
         cur.execute("""
@@ -132,14 +136,13 @@ def parse_id_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:
     except ValueError:
         return None
 
-def message_ids_to_check(update: Update) -> list[int]:
+def message_ids_to_check(msg) -> list[int]:
     """
     IDs that may represent the sender "entity" for moderation checks:
     - from_user.id: normal user/bot sender
     - via_bot.id: message posted via a bot
     - sender_chat.id: channel-as-sender OR anonymous admin
     """
-    msg = update.effective_message
     ids: list[int] = []
     if not msg:
         return ids
@@ -317,6 +320,27 @@ async def cmd_dbg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- sender_chat.id: {sender_chat_id}\n"
     )
 
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("Nutze /watch in einer Gruppe/Supergroup.")
+        return
+    watch_chats.add(chat.id)
+    watch_left[chat.id] = 20
+    await update.message.reply_text("👀 Watch aktiv: Ich logge die nächsten 20 Updates an dich privat.")
+
+async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    chat = update.effective_chat
+    if not chat:
+        return
+    watch_chats.discard(chat.id)
+    watch_left.pop(chat.id, None)
+    await update.message.reply_text("✅ Watch aus.")
+
 # -------------------- MAIN HANDLER --------------------
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -328,6 +352,28 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Track groups/supergroups/channels we see
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
         add_known_chat(chat.id)
+
+    # ---- WATCH DEBUG (verifies we receive updates at all) ----
+    if chat.id in watch_chats:
+        left = watch_left.get(chat.id, 0)
+        if left > 0:
+            fu = msg.from_user
+            txt = (
+                f"WATCH in {chat.id}:\n"
+                f"- from_user: {fu.id if fu else None}\n"
+                f"- is_bot: {fu.is_bot if fu else None}\n"
+                f"- via_bot: {msg.via_bot.id if msg.via_bot else None}\n"
+                f"- sender_chat: {msg.sender_chat.id if msg.sender_chat else None}\n"
+                f"- text: {(msg.text or msg.caption or '')[:80]}"
+            )
+            try:
+                await context.bot.send_message(chat_id=OWNER_ID, text=txt)
+            except:
+                pass
+            watch_left[chat.id] = left - 1
+        else:
+            watch_chats.discard(chat.id)
+            watch_left.pop(chat.id, None)
 
     # Only moderate in groups/supergroups
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -355,7 +401,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
-    ids = message_ids_to_check(update)
+    ids = message_ids_to_check(msg)
 
     # Global ban (requires a real user_id; we can only ban from_user)
     if msg.from_user and msg.from_user.id in banned_cache:
@@ -401,7 +447,10 @@ def main():
     # Debug
     app.add_handler(CommandHandler("testdelete", cmd_testdelete))
     app.add_handler(CommandHandler("dbg", cmd_dbg))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
 
+    # Main message stream
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
 
     app.run_polling(close_loop=False)
