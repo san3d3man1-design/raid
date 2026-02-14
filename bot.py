@@ -279,6 +279,44 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"chat_id: {chat.id} | type: {chat.type}")
 
+# -------------------- DEBUG COMMANDS --------------------
+async def cmd_testdelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    if not update.message or not update.message.reply_to_message:
+        await update.message.reply_text("Nutze /testdelete als Antwort auf eine Nachricht.")
+        return
+    try:
+        await update.message.reply_to_message.delete()
+        await update.message.reply_text("✅ testdelete: gelöscht")
+    except Exception as e:
+        await update.message.reply_text(f"❌ testdelete failed: {type(e).__name__}: {e}")
+
+async def cmd_dbg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    if not update.message or not update.message.reply_to_message:
+        await update.message.reply_text("Nutze /dbg als Antwort auf eine Nachricht.")
+        return
+
+    r = update.message.reply_to_message
+    chat = r.chat
+    from_id = r.from_user.id if r.from_user else None
+    from_is_bot = r.from_user.is_bot if r.from_user else None
+    via_id = r.via_bot.id if r.via_bot else None
+    sender_chat_id = r.sender_chat.id if r.sender_chat else None
+
+    await update.message.reply_text(
+        "DBG:\n"
+        f"- chat_id: {chat.id}\n"
+        f"- chat_type: {chat.type}\n"
+        f"- mutebot_active_here: {chat.id in bot_muted_chats_cache}\n"
+        f"- from_user.id: {from_id}\n"
+        f"- from_user.is_bot: {from_is_bot}\n"
+        f"- via_bot.id: {via_id}\n"
+        f"- sender_chat.id: {sender_chat_id}\n"
+    )
+
 # -------------------- MAIN HANDLER --------------------
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -359,6 +397,10 @@ def main():
     app.add_handler(CommandHandler("mutebot", cmd_mutebot))
     app.add_handler(CommandHandler("unmutebot", cmd_unmutebot))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+
+    # Debug
+    app.add_handler(CommandHandler("testdelete", cmd_testdelete))
+    app.add_handler(CommandHandler("dbg", cmd_dbg))
 
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
 
