@@ -33,7 +33,7 @@ muted_cache: set[int] = set()
 banned_cache: set[int] = set()
 bot_muted_chats_cache: set[int] = set()  # chats where all bot/via_bot messages get deleted
 
-# NEW: lock title + photo for chats (global /lockinfo)
+# Lock title + photo for chats (global /lockinfo)
 locked_info_cache: dict[int, dict[str, str | None]] = {}
 
 # Watch/debug (to verify whether we receive updates for certain messages)
@@ -63,7 +63,7 @@ def db_init():
         );
         """)
 
-        # NEW: locked group info (title + photo)
+        # Locked group info (title + photo)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS locked_group_info (
             chat_id BIGINT PRIMARY KEY,
@@ -84,7 +84,7 @@ def load_caches():
         cur.execute("SELECT chat_id FROM bot_muted_chats")
         bot_muted_chats_cache = {int(r["chat_id"]) for r in cur.fetchall()}
 
-        # NEW: load locked group info
+        # Load locked group info
         cur.execute("SELECT chat_id, title, photo_file_id FROM locked_group_info")
         rows = cur.fetchall()
         locked_info_cache = {
@@ -143,7 +143,7 @@ def remove_bot_mute_chat(chat_id: int):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM bot_muted_chats WHERE chat_id=%s", (chat_id,))
 
-# NEW: locked group info persistence
+# Locked group info persistence
 def upsert_locked_info(chat_id: int, title: str | None, photo_file_id: str | None):
     locked_info_cache[chat_id] = {"title": title, "photo_file_id": photo_file_id}
     with conn.cursor() as cur:
@@ -195,7 +195,6 @@ def message_ids_to_check(msg) -> list[int]:
 
     return ids
 
-# NEW: check bot admin + can_change_info
 async def bot_can_change_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
     try:
         me = await context.bot.get_me()
@@ -208,6 +207,34 @@ async def bot_can_change_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         return bool(getattr(m, "can_change_info", False))
     except Exception:
         return False
+
+async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=text)
+    except Exception:
+        pass
+
+async def restore_chat_photo_from_file_id(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, photo_file_id: str | None
+):
+    """
+    Telegram setChatPhoto requires an uploaded file (InputFile). A file_id alone is not enough.
+    We download the photo and re-upload it as bytes.
+    If photo_file_id is None -> delete chat photo.
+    """
+    try:
+        if not photo_file_id:
+            await context.bot.delete_chat_photo(chat_id)
+            return
+
+        tg_file = await context.bot.get_file(photo_file_id)
+        data = await tg_file.download_as_bytearray()
+        await context.bot.set_chat_photo(chat_id=chat_id, photo=data)
+    except Exception as e:
+        await notify_owner(
+            context,
+            f"❌ restore_chat_photo failed in chat {chat_id}: {type(e).__name__}: {e}",
+        )
 
 # -------------------- COMMANDS --------------------
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -335,7 +362,7 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"chat_id: {chat.id} | type: {chat.type}")
 
-# NEW: Lock/Unlock group title + photo for ALL known groups where bot is admin
+# Lock/Unlock group title + photo for ALL known groups where bot is admin
 async def cmd_lockinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return
@@ -443,7 +470,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
         add_known_chat(chat.id)
 
-    # NEW: LOCKED GROUP INFO (title + photo) -> revert immediately on service events
+    # LOCKED GROUP INFO (title + photo) -> revert immediately on service events
     # Works when Telegram delivers service messages: new_chat_title / new_chat_photo / delete_chat_photo
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id in locked_info_cache:
         locked = locked_info_cache[chat.id]
@@ -453,17 +480,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 if locked.get("title"):
                     await context.bot.set_chat_title(chat.id, locked["title"])
-            except Exception:
-                pass
+            except Exception as e:
+                await notify_owner(
+                    context,
+                    f"❌ set_chat_title failed in chat {chat.id}: {type(e).__name__}: {e}",
+                )
 
-        # Photo changed or deleted
+        # Photo changed or deleted -> restore (re-upload) or delete if locked has no photo
         if getattr(msg, "new_chat_photo", None) or getattr(msg, "delete_chat_photo", None):
-            try:
-                pfid = locked.get("photo_file_id")
-                if pfid:
-                    await context.bot.set_chat_photo(chat.id, photo=pfid)
-            except Exception:
-                pass
+            await restore_chat_photo_from_file_id(context, chat.id, locked.get("photo_file_id"))
 
     # ---- WATCH DEBUG (verifies we receive updates at all) ----
     if chat.id in watch_chats:
@@ -556,7 +581,7 @@ def main():
     app.add_handler(CommandHandler("unmutebot", cmd_unmutebot))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
 
-    # NEW: group info lock (title + photo)
+    # Group info lock (title + photo)
     app.add_handler(CommandHandler("lockinfo", cmd_lockinfo))
     app.add_handler(CommandHandler("unlockinfo", cmd_unlockinfo))
 
