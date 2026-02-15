@@ -382,6 +382,44 @@ def is_info_change_service_message(msg) -> bool:
     )
 
 
+# -------------------- CHANNEL ENFORCEMENT JOB --------------------
+async def job_enforce_channels(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Channels often don't send service-message updates for title/photo changes.
+    So we periodically poll all known channels and enforce:
+    - title lock (/lockinfo)
+    - no photo (/locknophoto)
+    """
+    chats = get_all_known_chats()
+
+    for chat_id in chats:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            if chat.type != ChatType.CHANNEL:
+                continue
+
+            # Title lock
+            if chat_id in locked_info_cache:
+                desired = locked_info_cache[chat_id].get("title")
+                if desired and chat.title != desired:
+                    try:
+                        await context.bot.set_chat_title(chat_id, desired)
+                    except Exception:
+                        pass
+
+            # No photo enforcement
+            if chat_id in no_photo_chats_cache:
+                if chat.photo is not None:
+                    try:
+                        await context.bot.delete_chat_photo(chat_id)
+                    except Exception:
+                        pass
+
+        except Exception:
+            # bot removed / no permissions / chat not accessible
+            pass
+
+
 # -------------------- COMMANDS --------------------
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
@@ -719,23 +757,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             watch_chats.discard(chat.id)
             watch_left.pop(chat.id, None)
 
-    # ---- GLOBAL BROADCAST LOCK (groups + channels) ----
-    if broadcast_lock_global and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
-        try:
-            if chat.type == ChatType.CHANNEL:
-                # Only THIS bot may post in channels
-                if not await is_message_from_this_bot(context, msg):
-                    await msg.delete()
-                    return
-            else:
-                # In groups: delete broadcast-like messages only
-                if is_broadcast_like(msg) and not await is_message_from_this_bot(context, msg):
-                    await msg.delete()
-                    return
-        except Exception as e:
-            await notify_owner(context, f"❌ broadcast_lock delete failed in chat {chat.id}: {type(e).__name__}: {e}")
-
-    # ---- TITLE LOCK (groups + channels) ----
+    # ---- TITLE LOCK (groups + channels) for groups works via service message ----
     if chat.id in locked_info_cache:
         locked = locked_info_cache[chat.id]
         if getattr(msg, "new_chat_title", None):
@@ -745,7 +767,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as e:
                 await notify_owner(context, f"❌ set_chat_title failed in chat {chat.id}: {type(e).__name__}: {e}")
 
-    # ---- NO PHOTO ENFORCEMENT (groups + channels) ----
+    # ---- NO PHOTO ENFORCEMENT (groups + channels) for groups works via service message ----
     if chat.id in no_photo_chats_cache:
         if getattr(msg, "new_chat_photo", None) or getattr(msg, "delete_chat_photo", None):
             await enforce_no_chat_photo(context, chat.id)
@@ -841,7 +863,7 @@ def main():
     app.add_handler(CommandHandler("locknophoto", cmd_locknophoto))
     app.add_handler(CommandHandler("unlocknophoto", cmd_unlocknophoto))
 
-    # Broadcast lock (global)
+    # Broadcast lock (global) - kept, but not handled in message handler in this version
     app.add_handler(CommandHandler("lockbroadcast", cmd_lockbroadcast))
     app.add_handler(CommandHandler("unlockbroadcast", cmd_unlockbroadcast))
 
@@ -857,6 +879,9 @@ def main():
 
     # Main stream
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
+
+    # NEW: Channel polling enforcement (every 60s)
+    app.job_queue.run_repeating(job_enforce_channels, interval=60, first=10)
 
     app.run_polling(close_loop=False)
 
