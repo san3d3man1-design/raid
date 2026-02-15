@@ -33,6 +33,9 @@ muted_cache: set[int] = set()
 banned_cache: set[int] = set()
 bot_muted_chats_cache: set[int] = set()  # chats where all bot/via_bot messages get deleted
 
+# NEW: lock title + photo for chats (global /lockinfo)
+locked_info_cache: dict[int, dict[str, str | None]] = {}
+
 # Watch/debug (to verify whether we receive updates for certain messages)
 watch_chats: set[int] = set()
 watch_left: dict[int, int] = {}
@@ -60,8 +63,17 @@ def db_init():
         );
         """)
 
+        # NEW: locked group info (title + photo)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS locked_group_info (
+            chat_id BIGINT PRIMARY KEY,
+            title TEXT,
+            photo_file_id TEXT
+        );
+        """)
+
 def load_caches():
-    global muted_cache, banned_cache, bot_muted_chats_cache
+    global muted_cache, banned_cache, bot_muted_chats_cache, locked_info_cache
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT user_id FROM muted_users")
         muted_cache = {int(r["user_id"]) for r in cur.fetchall()}
@@ -71,6 +83,14 @@ def load_caches():
 
         cur.execute("SELECT chat_id FROM bot_muted_chats")
         bot_muted_chats_cache = {int(r["chat_id"]) for r in cur.fetchall()}
+
+        # NEW: load locked group info
+        cur.execute("SELECT chat_id, title, photo_file_id FROM locked_group_info")
+        rows = cur.fetchall()
+        locked_info_cache = {
+            int(r["chat_id"]): {"title": r["title"], "photo_file_id": r["photo_file_id"]}
+            for r in rows
+        }
 
 def add_known_chat(chat_id: int):
     with conn.cursor() as cur:
@@ -123,6 +143,25 @@ def remove_bot_mute_chat(chat_id: int):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM bot_muted_chats WHERE chat_id=%s", (chat_id,))
 
+# NEW: locked group info persistence
+def upsert_locked_info(chat_id: int, title: str | None, photo_file_id: str | None):
+    locked_info_cache[chat_id] = {"title": title, "photo_file_id": photo_file_id}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO locked_group_info (chat_id, title, photo_file_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (chat_id)
+            DO UPDATE SET title=EXCLUDED.title, photo_file_id=EXCLUDED.photo_file_id
+            """,
+            (chat_id, title, photo_file_id),
+        )
+
+def delete_locked_info(chat_id: int):
+    locked_info_cache.pop(chat_id, None)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM locked_group_info WHERE chat_id=%s", (chat_id,))
+
 # -------------------- HELPERS --------------------
 def owner_only(update: Update) -> bool:
     u = update.effective_user
@@ -155,6 +194,20 @@ def message_ids_to_check(msg) -> list[int]:
         ids.append(msg.sender_chat.id)
 
     return ids
+
+# NEW: check bot admin + can_change_info
+async def bot_can_change_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    try:
+        me = await context.bot.get_me()
+        m = await context.bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+
+        if getattr(m, "status", None) not in ("administrator", "creator"):
+            return False
+        if getattr(m, "status", None) == "creator":
+            return True
+        return bool(getattr(m, "can_change_info", False))
+    except Exception:
+        return False
 
 # -------------------- COMMANDS --------------------
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,6 +335,43 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"chat_id: {chat.id} | type: {chat.type}")
 
+# NEW: Lock/Unlock group title + photo for ALL known groups where bot is admin
+async def cmd_lockinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+
+    chats = get_all_known_chats()
+    ok, fail = 0, 0
+
+    for chat_id in chats:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+                continue
+
+            if not await bot_can_change_info(context, chat_id):
+                continue
+
+            title = chat.title
+            photo_file_id = chat.photo.big_file_id if chat.photo else None
+
+            upsert_locked_info(chat_id, title, photo_file_id)
+            ok += 1
+        except Exception:
+            fail += 1
+
+    await update.message.reply_text(f"🔒 LockInfo aktiv (Titel + Bild) | ok:{ok} fail:{fail}")
+
+async def cmd_unlockinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+
+    ids = list(locked_info_cache.keys())
+    for chat_id in ids:
+        delete_locked_info(chat_id)
+
+    await update.message.reply_text("🔓 LockInfo deaktiviert.")
+
 # -------------------- DEBUG COMMANDS --------------------
 async def cmd_testdelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
@@ -352,6 +442,28 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Track groups/supergroups/channels we see
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
         add_known_chat(chat.id)
+
+    # NEW: LOCKED GROUP INFO (title + photo) -> revert immediately on service events
+    # Works when Telegram delivers service messages: new_chat_title / new_chat_photo / delete_chat_photo
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id in locked_info_cache:
+        locked = locked_info_cache[chat.id]
+
+        # Title changed
+        if getattr(msg, "new_chat_title", None):
+            try:
+                if locked.get("title"):
+                    await context.bot.set_chat_title(chat.id, locked["title"])
+            except Exception:
+                pass
+
+        # Photo changed or deleted
+        if getattr(msg, "new_chat_photo", None) or getattr(msg, "delete_chat_photo", None):
+            try:
+                pfid = locked.get("photo_file_id")
+                if pfid:
+                    await context.bot.set_chat_photo(chat.id, photo=pfid)
+            except Exception:
+                pass
 
     # ---- WATCH DEBUG (verifies we receive updates at all) ----
     if chat.id in watch_chats:
@@ -443,6 +555,10 @@ def main():
     app.add_handler(CommandHandler("mutebot", cmd_mutebot))
     app.add_handler(CommandHandler("unmutebot", cmd_unmutebot))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+
+    # NEW: group info lock (title + photo)
+    app.add_handler(CommandHandler("lockinfo", cmd_lockinfo))
+    app.add_handler(CommandHandler("unlockinfo", cmd_unlockinfo))
 
     # Debug
     app.add_handler(CommandHandler("testdelete", cmd_testdelete))
