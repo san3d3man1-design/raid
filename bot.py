@@ -43,6 +43,12 @@ no_photo_chats_cache: set[int] = set()
 broadcast_lock_global: bool = False
 clean_info_global: bool = False
 
+# Auto-mute ALL group admins (global)
+auto_admin_mute_global: bool = False
+
+# Whitelist (admins allowed even if auto_admin_mute_global is ON)
+whitelist_cache: set[int] = set()
+
 # Bot id cache (for "only my bot may post")
 BOT_ID_CACHE: int | None = None
 
@@ -50,94 +56,95 @@ BOT_ID_CACHE: int | None = None
 # -------------------- DB INIT / LOAD --------------------
 def db_init():
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS muted_users (
             user_id BIGINT PRIMARY KEY
         );
-        """
-        )
-        cur.execute(
-            """
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
             user_id BIGINT PRIMARY KEY
         );
-        """
-        )
-        cur.execute(
-            """
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS known_chats (
             chat_id BIGINT PRIMARY KEY
         );
-        """
-        )
-        cur.execute(
-            """
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_muted_chats (
             chat_id BIGINT PRIMARY KEY
         );
-        """
-        )
+        """)
 
         # Locked chat info (title + legacy photo_file_id column kept)
-        cur.execute(
-            """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS locked_group_info (
             chat_id BIGINT PRIMARY KEY,
             title TEXT,
             photo_file_id TEXT
         );
-        """
-        )
+        """)
 
         # Chats where chat photo should always be deleted
-        cur.execute(
-            """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS no_photo_chats (
             chat_id BIGINT PRIMARY KEY
         );
-        """
-        )
+        """)
 
         # Global broadcast lock state (single row)
-        cur.execute(
-            """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS broadcast_lock_state (
             id SMALLINT PRIMARY KEY,
             enabled BOOLEAN NOT NULL DEFAULT FALSE
         );
-        """
-        )
-        cur.execute(
-            """
+        """)
+        cur.execute("""
         INSERT INTO broadcast_lock_state (id, enabled)
         VALUES (1, FALSE)
         ON CONFLICT (id) DO NOTHING;
-        """
-        )
+        """)
 
         # Global clean info events state (single row)
-        cur.execute(
-            """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS clean_info_state (
             id SMALLINT PRIMARY KEY,
             enabled BOOLEAN NOT NULL DEFAULT FALSE
         );
-        """
-        )
-        cur.execute(
-            """
+        """)
+        cur.execute("""
         INSERT INTO clean_info_state (id, enabled)
         VALUES (1, FALSE)
         ON CONFLICT (id) DO NOTHING;
-        """
-        )
+        """)
+
+        # Auto admin mute state (single row)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS auto_admin_mute_state (
+            id SMALLINT PRIMARY KEY,
+            enabled BOOLEAN NOT NULL DEFAULT FALSE
+        );
+        """)
+        cur.execute("""
+        INSERT INTO auto_admin_mute_state (id, enabled)
+        VALUES (1, FALSE)
+        ON CONFLICT (id) DO NOTHING;
+        """)
+
+        # Whitelist users (global)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS whitelist_users (
+            user_id BIGINT PRIMARY KEY
+        );
+        """)
 
 
 def load_caches():
     global muted_cache, banned_cache, bot_muted_chats_cache
     global locked_info_cache, no_photo_chats_cache
     global broadcast_lock_global, clean_info_global
+    global auto_admin_mute_global, whitelist_cache
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT user_id FROM muted_users")
@@ -167,6 +174,16 @@ def load_caches():
         row = cur.fetchone()
         clean_info_global = bool(row["enabled"]) if row else False
 
+        cur.execute("SELECT enabled FROM auto_admin_mute_state WHERE id=1")
+        row = cur.fetchone()
+        auto_admin_mute_global = bool(row["enabled"]) if row else False
+
+        cur.execute("SELECT user_id FROM whitelist_users")
+        whitelist_cache = {int(r["user_id"]) for r in cur.fetchall()}
+
+    # Owner should NEVER get blocked
+    whitelist_cache.add(OWNER_ID)
+
 
 def set_broadcast_lock_state(enabled: bool):
     global broadcast_lock_global
@@ -180,6 +197,30 @@ def set_clean_info_state(enabled: bool):
     clean_info_global = enabled
     with conn.cursor() as cur:
         cur.execute("UPDATE clean_info_state SET enabled=%s WHERE id=1", (enabled,))
+
+
+def set_auto_admin_mute_state(enabled: bool):
+    global auto_admin_mute_global
+    auto_admin_mute_global = enabled
+    with conn.cursor() as cur:
+        cur.execute("UPDATE auto_admin_mute_state SET enabled=%s WHERE id=1", (enabled,))
+
+
+def add_whitelist(user_id: int):
+    whitelist_cache.add(user_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO whitelist_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (user_id,),
+        )
+
+
+def remove_whitelist(user_id: int):
+    if user_id == OWNER_ID:
+        return  # owner always allowed
+    whitelist_cache.discard(user_id)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM whitelist_users WHERE user_id=%s", (user_id,))
 
 
 # -------------------- DB HELPERS --------------------
@@ -427,6 +468,42 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         if update.message:
             await update.message.reply_text("❌ Senden fehlgeschlagen (keine Rechte oder Kanal erlaubt es nicht).")
+
+
+async def cmd_auto_admin_mute_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    set_auto_admin_mute_state(True)
+    await update.message.reply_text("🔇 Auto-Admin-Mute GLOBAL AN (Admins werden gelöscht, außer Whitelist).")
+
+
+async def cmd_auto_admin_mute_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    set_auto_admin_mute_state(False)
+    await update.message.reply_text("🔊 Auto-Admin-Mute GLOBAL AUS.")
+
+
+async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    user_id = parse_id_arg(context)
+    if user_id is None:
+        await update.message.reply_text("Usage: /whitelist <userid>")
+        return
+    add_whitelist(user_id)
+    await update.message.reply_text(f"✅ Whitelisted: {user_id}")
+
+
+async def cmd_unwhitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    user_id = parse_id_arg(context)
+    if user_id is None:
+        await update.message.reply_text("Usage: /unwhitelist <userid>")
+        return
+    remove_whitelist(user_id)
+    await update.message.reply_text(f"✅ Unwhitelisted: {user_id}")
 
 
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -688,6 +765,28 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
+    # ---- AUTO MUTE ALL ADMINS (instant, also new admins) ----
+    if auto_admin_mute_global and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        try:
+            if msg.from_user:
+                uid = msg.from_user.id
+
+                # allow owner + whitelisted + this bot
+                if uid in whitelist_cache:
+                    pass
+                elif await is_message_from_this_bot(context, msg):
+                    pass
+                else:
+                    m = await context.bot.get_chat_member(chat.id, uid)
+                    if getattr(m, "status", None) in ("administrator", "creator"):
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+                        return
+        except Exception:
+            pass
+
     # ---- TITLE LOCK (groups via service message; channels via job) ----
     if chat.id in locked_info_cache:
         locked = locked_info_cache[chat.id]
@@ -774,6 +873,11 @@ def main():
 
     # Commands
     app.add_handler(CommandHandler("send", cmd_send))
+
+    app.add_handler(CommandHandler("auto_admin_mute_on", cmd_auto_admin_mute_on))
+    app.add_handler(CommandHandler("auto_admin_mute_off", cmd_auto_admin_mute_off))
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
+    app.add_handler(CommandHandler("unwhitelist", cmd_unwhitelist))
 
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
