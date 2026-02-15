@@ -28,7 +28,7 @@ if OWNER_ID == 0:
 conn = psycopg2.connect(DATABASE_URL, sslmode="require")
 conn.autocommit = True
 
-# -------------------- CACHES (fast) --------------------
+# -------------------- CACHES --------------------
 muted_cache: set[int] = set()
 banned_cache: set[int] = set()
 bot_muted_chats_cache: set[int] = set()  # chats where all bot/via_bot messages get deleted
@@ -39,8 +39,12 @@ locked_info_cache: dict[int, dict[str, str | None]] = {}
 # Enforce "NO chat photo" (groups + channels) when enabled
 no_photo_chats_cache: set[int] = set()
 
-# Global clean info-events (delete “title/photo changed” service messages)
+# Global locks
+broadcast_lock_global: bool = False
 clean_info_global: bool = False
+
+# Bot id cache (for "only my bot may post")
+BOT_ID_CACHE: int | None = None
 
 
 # -------------------- DB INIT / LOAD --------------------
@@ -75,7 +79,7 @@ def db_init():
         """
         )
 
-        # Locked chat info (title + legacy photo_file_id column kept for backward compatibility)
+        # Locked chat info (title + legacy photo_file_id column kept)
         cur.execute(
             """
         CREATE TABLE IF NOT EXISTS locked_group_info (
@@ -92,6 +96,23 @@ def db_init():
         CREATE TABLE IF NOT EXISTS no_photo_chats (
             chat_id BIGINT PRIMARY KEY
         );
+        """
+        )
+
+        # Global broadcast lock state (single row)
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS broadcast_lock_state (
+            id SMALLINT PRIMARY KEY,
+            enabled BOOLEAN NOT NULL DEFAULT FALSE
+        );
+        """
+        )
+        cur.execute(
+            """
+        INSERT INTO broadcast_lock_state (id, enabled)
+        VALUES (1, FALSE)
+        ON CONFLICT (id) DO NOTHING;
         """
         )
 
@@ -114,8 +135,9 @@ def db_init():
 
 
 def load_caches():
-    global muted_cache, banned_cache, bot_muted_chats_cache, locked_info_cache, no_photo_chats_cache
-    global clean_info_global
+    global muted_cache, banned_cache, bot_muted_chats_cache
+    global locked_info_cache, no_photo_chats_cache
+    global broadcast_lock_global, clean_info_global
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT user_id FROM muted_users")
@@ -137,9 +159,20 @@ def load_caches():
         cur.execute("SELECT chat_id FROM no_photo_chats")
         no_photo_chats_cache = {int(r["chat_id"]) for r in cur.fetchall()}
 
+        cur.execute("SELECT enabled FROM broadcast_lock_state WHERE id=1")
+        row = cur.fetchone()
+        broadcast_lock_global = bool(row["enabled"]) if row else False
+
         cur.execute("SELECT enabled FROM clean_info_state WHERE id=1")
         row = cur.fetchone()
         clean_info_global = bool(row["enabled"]) if row else False
+
+
+def set_broadcast_lock_state(enabled: bool):
+    global broadcast_lock_global
+    broadcast_lock_global = enabled
+    with conn.cursor() as cur:
+        cur.execute("UPDATE broadcast_lock_state SET enabled=%s WHERE id=1", (enabled,))
 
 
 def set_clean_info_state(enabled: bool):
@@ -276,6 +309,7 @@ async def bot_can_change_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     try:
         me = await context.bot.get_me()
         m = await context.bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+
         if getattr(m, "status", None) not in ("administrator", "creator"):
             return False
         if getattr(m, "status", None) == "creator":
@@ -298,6 +332,34 @@ def is_info_change_service_message(msg) -> bool:
         or getattr(msg, "new_chat_photo", None)
         or getattr(msg, "delete_chat_photo", None)
     )
+
+
+async def get_bot_id(context: ContextTypes.DEFAULT_TYPE) -> int:
+    global BOT_ID_CACHE
+    if BOT_ID_CACHE is None:
+        me = await context.bot.get_me()
+        BOT_ID_CACHE = me.id
+    return BOT_ID_CACHE
+
+
+async def is_message_from_this_bot(context: ContextTypes.DEFAULT_TYPE, msg) -> bool:
+    bot_id = await get_bot_id(context)
+    if msg.from_user and msg.from_user.is_bot and msg.from_user.id == bot_id:
+        return True
+    if msg.via_bot and msg.via_bot.id == bot_id:
+        return True
+    return False
+
+
+def is_broadcast_like(msg) -> bool:
+    if getattr(msg, "sender_chat", None) is not None:
+        return True
+    if bool(getattr(msg, "is_automatic_forward", False)):
+        return True
+    fchat = getattr(msg, "forward_from_chat", None)
+    if fchat and getattr(fchat, "type", None) == ChatType.CHANNEL:
+        return True
+    return False
 
 
 # -------------------- CHANNEL ENFORCEMENT JOB --------------------
@@ -348,6 +410,7 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
         return
+
     if not context.args:
         if update.message:
             await update.message.reply_text("Usage: /send <Nachricht>")
@@ -569,6 +632,20 @@ async def cmd_unlocknophoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ No-Photo deaktiviert.")
 
 
+async def cmd_lockbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    set_broadcast_lock_state(True)
+    await update.message.reply_text("🔒 Broadcast-Lock GLOBAL aktiv.")
+
+
+async def cmd_unlockbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        return
+    set_broadcast_lock_state(False)
+    await update.message.reply_text("🔓 Broadcast-Lock GLOBAL aus.")
+
+
 async def cmd_cleaninfo_global_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return
@@ -595,6 +672,22 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
         add_known_chat(chat.id)
 
+    # ---- GLOBAL BROADCAST LOCK (groups + channels) ----
+    if broadcast_lock_global and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
+        try:
+            if chat.type == ChatType.CHANNEL:
+                # In channels: ONLY this bot may post
+                if not await is_message_from_this_bot(context, msg):
+                    await msg.delete()
+                    return
+            else:
+                # In groups: delete broadcast-like messages only (except from this bot)
+                if is_broadcast_like(msg) and not await is_message_from_this_bot(context, msg):
+                    await msg.delete()
+                    return
+        except Exception:
+            pass
+
     # ---- TITLE LOCK (groups via service message; channels via job) ----
     if chat.id in locked_info_cache:
         locked = locked_info_cache[chat.id]
@@ -619,7 +712,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pass
             return
 
-    # -------------------- GROUP MODERATION (unchanged) --------------------
+    # -------------------- GROUP MODERATION --------------------
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
@@ -675,11 +768,11 @@ def main():
     db_init()
     load_caches()
 
-    # ✅ Application erstellen (JobQueue wird automatisch geladen,
-    # wenn python-telegram-bot[job-queue] installiert ist)
+    # IMPORTANT: JobQueue works only if you installed:
+    # python-telegram-bot[job-queue]==20.7
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # ---------------- COMMANDS ----------------
+    # Commands
     app.add_handler(CommandHandler("send", cmd_send))
 
     app.add_handler(CommandHandler("mute", cmd_mute))
@@ -698,23 +791,18 @@ def main():
     app.add_handler(CommandHandler("locknophoto", cmd_locknophoto))
     app.add_handler(CommandHandler("unlocknophoto", cmd_unlocknophoto))
 
+    app.add_handler(CommandHandler("lockbroadcast", cmd_lockbroadcast))
+    app.add_handler(CommandHandler("unlockbroadcast", cmd_unlockbroadcast))
+
     app.add_handler(CommandHandler("cleaninfo_global_on", cmd_cleaninfo_global_on))
     app.add_handler(CommandHandler("cleaninfo_global_off", cmd_cleaninfo_global_off))
 
-    # ---------------- MESSAGE STREAM ----------------
+    # Main stream
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
 
-    # ---------------- CHANNEL POLLING ----------------
-    # Prüft alle 60 Sekunden:
-    # - Kanal Titel
-    # - Kanal Profilbild
-    app.job_queue.run_repeating(
-        job_enforce_channels,
-        interval=60,
-        first=10
-    )
+    # Channel polling enforcement (every 60s)
+    app.job_queue.run_repeating(job_enforce_channels, interval=60, first=10)
 
-    # ---------------- START ----------------
     app.run_polling(close_loop=False)
 
 
