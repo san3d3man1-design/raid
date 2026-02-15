@@ -675,15 +675,11 @@ def main():
     db_init()
     load_caches()
 
+    # ✅ Application erstellen (JobQueue wird automatisch geladen,
+    # wenn python-telegram-bot[job-queue] installiert ist)
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # ✅ JobQueue manuell erstellen (kompatibel mit PTB-Versionen, wo app.job_queue None ist)
-    from telegram.ext import JobQueue
-    job_queue = JobQueue()
-    job_queue.set_application(app)
-    app.job_queue = job_queue
-
-    # Commands
+    # ---------------- COMMANDS ----------------
     app.add_handler(CommandHandler("send", cmd_send))
 
     app.add_handler(CommandHandler("mute", cmd_mute))
@@ -705,12 +701,20 @@ def main():
     app.add_handler(CommandHandler("cleaninfo_global_on", cmd_cleaninfo_global_on))
     app.add_handler(CommandHandler("cleaninfo_global_off", cmd_cleaninfo_global_off))
 
-    # Main stream
+    # ---------------- MESSAGE STREAM ----------------
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
 
-    # ✅ Channel polling enforcement (every 60s)
-    app.job_queue.run_repeating(job_enforce_channels, interval=60, first=10)
+    # ---------------- CHANNEL POLLING ----------------
+    # Prüft alle 60 Sekunden:
+    # - Kanal Titel
+    # - Kanal Profilbild
+    app.job_queue.run_repeating(
+        job_enforce_channels,
+        interval=60,
+        first=10
+    )
 
+    # ---------------- START ----------------
     app.run_polling(close_loop=False)
 
 
