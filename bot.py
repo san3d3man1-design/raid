@@ -346,23 +346,6 @@ async def enforce_no_chat_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         await notify_owner(context, f"❌ delete_chat_photo failed in chat {chat_id}: {type(e).__name__}: {e}")
 
 
-async def get_bot_id(context: ContextTypes.DEFAULT_TYPE) -> int:
-    global BOT_ID_CACHE
-    if BOT_ID_CACHE is None:
-        me = await context.bot.get_me()
-        BOT_ID_CACHE = me.id
-    return BOT_ID_CACHE
-
-
-async def is_message_from_this_bot(context: ContextTypes.DEFAULT_TYPE, msg) -> bool:
-    bot_id = await get_bot_id(context)
-    if msg.from_user and msg.from_user.is_bot and msg.from_user.id == bot_id:
-        return True
-    if msg.via_bot and msg.via_bot.id == bot_id:
-        return True
-    return False
-
-
 def is_broadcast_like(msg) -> bool:
     if getattr(msg, "sender_chat", None) is not None:
         return True
@@ -841,7 +824,8 @@ def main():
     db_init()
     load_caches()
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    # ✅ FIX: enable JobQueue explicitly (prevents app.job_queue == None)
+    app = ApplicationBuilder().token(TOKEN).job_queue(True).build()
 
     # Moderation commands
     app.add_handler(CommandHandler("mute", cmd_mute))
@@ -880,7 +864,7 @@ def main():
     # Main stream
     app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
 
-    # NEW: Channel polling enforcement (every 60s)
+    # ✅ Channel polling enforcement (every 60s)
     app.job_queue.run_repeating(job_enforce_channels, interval=60, first=10)
 
     app.run_polling(close_loop=False)
